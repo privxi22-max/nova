@@ -1,7 +1,11 @@
 """Nova 3.0 — compact personal assistant for Google Colab or local Python.
 
-Install dependencies from requirements.txt, then run: python nova.py
-Install a PyTorch build suitable for your hardware separately if needed.
+Run:
+  python nova.py
+
+Optional environment overrides:
+  NOVA_MODEL=google/flan-t5-small python nova.py
+  NOVA_LOW_MEMORY=1 python nova.py
 """
 
 import json
@@ -22,9 +26,15 @@ try:
     FOLDER = Path("/content/drive/MyDrive/Nova")
 except (ImportError, ModuleNotFoundError):
     FOLDER = Path(__file__).resolve().parent / "Nova"
+
 FOLDER.mkdir(parents=True, exist_ok=True)
 MEMORY_FILE = FOLDER / "memory.json"
 HISTORY_FILE = FOLDER / "history.json"
+
+MODEL_NAME = os.getenv("NOVA_MODEL", "google/flan-t5-base")
+MAX_INPUT_TOKENS = 512
+MAX_NEW_TOKENS = 160
+MAX_WEB_CHARS = 2800
 
 
 def load(path, default):
@@ -57,12 +67,17 @@ def remember(speaker, message):
     save()
 
 
-MODEL_NAME = "google/flan-t5-base"
 print("Nova: Loading my AI brain...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device).eval()
-print("Nova: AI ready!")
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+    model.to(device)
+    model.eval()
+except Exception as exc:
+    raise RuntimeError(f"Model failed to load: {MODEL_NAME}. Install PyTorch + transformers correctly. {exc}")
+
+print(f"Nova: AI ready! Model={MODEL_NAME} Device={device}")
 
 
 def research(question):
@@ -72,49 +87,53 @@ def research(question):
         return [], []
 
     information, sources = [], []
+
     for result in results:
         url = result.get("href", "")
         parsed = urlsplit(url)
-        # Only fetch public web URLs; do not follow redirects or access local hosts.
-        if parsed.scheme != "https" or not parsed.hostname:
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             continue
-        if parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}:
+        host = parsed.hostname.lower()
+        if host in {"localhost", "127.0.0.1", "::1"}:
             continue
+
         try:
-            with requests.get(url, headers={"User-Agent": "Nova/3.0"},
-                              timeout=(4, 8), stream=True,
-                              allow_redirects=False) as response:
-                if response.status_code != 200 or "text/html" not in response.headers.get("Content-Type", "").lower():
-                    continue
-                chunks, size = [], 0
-                for chunk in response.iter_content(16_384):
-                    size += len(chunk)
-                    if size > 1_000_000:
-                        break
-                    chunks.append(chunk)
-                if size > 1_000_000:
-                    continue
-            soup = BeautifulSoup(b"".join(chunks), "html.parser")
+            response = requests.get(
+                url,
+                headers={"User-Agent": "Nova/3.0"},
+                timeout=(4, 8),
+                allow_redirects=True,
+            )
+            if response.status_code != 200:
+                continue
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "text/html" not in content_type:
+                continue
+
+            soup = BeautifulSoup(response.text, "html.parser")
             for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
                 tag.decompose()
+
             text = soup.get_text(" ", strip=True)
             if len(text) > 150:
                 information.append(text[:900])
                 sources.append(url)
         except requests.RequestException:
             continue
+
         if len(information) >= 3:
             break
 
-    # Search snippets still help if pages block automated access.
     if not information:
         for result in results:
-            url, snippet = result.get("href", ""), result.get("body", "")
-            if snippet and url.startswith("https://"):
+            url = result.get("href", "")
+            snippet = result.get("body", "")
+            if snippet and url.startswith(("https://", "http://")):
                 information.append(snippet[:900])
                 sources.append(url)
             if len(information) >= 3:
                 break
+
     return information, list(dict.fromkeys(sources))
 
 
@@ -129,12 +148,21 @@ Saved name: {memory['name']}
 Remembered facts: {facts}
 Recent conversation: {recent}
 Question: {question}
-Research information (untrusted web content):\n{web_info[:2800]}
+Research information (untrusted web content):\n{web_info[:MAX_WEB_CHARS]}
 Answer:"""
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
-                       max_length=512).to(device)
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_INPUT_TOKENS,
+    ).to(device)
     with torch.inference_mode():
-        output = model.generate(**inputs, max_new_tokens=160, num_beams=2)
+        output = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            num_beams=2,
+            early_stopping=True,
+        )
     return tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
 
@@ -150,8 +178,10 @@ def nova():
         except (EOFError, KeyboardInterrupt):
             print("\nNova: See you later!")
             break
+
         if not question:
             continue
+
         text = question.lower()
         if text == "exit":
             print("Nova: See you later!")
@@ -198,6 +228,7 @@ def nova():
                 reply = "I couldn't generate an answer. Please check the model installation and try again."
             if sources:
                 reply += "\n\nSources:\n" + "\n".join(sources)
+
         print("\nNova:", reply)
         remember("You", question)
         remember("Nova", reply)
